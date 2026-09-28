@@ -6,9 +6,12 @@ import uuid
 
 BROADCAST_PORT = 50000
 ANNOUNCE_INTERVAL = 3  
+PEER_TIMEOUT = 10  
 
 PEER_ID = uuid.uuid4().hex[:8]   
 PEER_NAME = socket.gethostname()
+peers = {} 
+peers_lock = threading.Lock()
 
 def build_message():
     return json.dumps({
@@ -23,10 +26,37 @@ def send_discovery_broadcast():
     sock.sendto(build_message(), ('255.255.255.255', BROADCAST_PORT))
     sock.close()
 
+def update_peer(peer_id, name, ip):
+    with peers_lock:
+        is_new = peer_id not in peers
+        peers[peer_id] = {
+            "name": name,
+            "ip": ip,
+            "last_seen": time.monotonic(),
+        }
+    if is_new:
+        print(f"[peers] + joined: {peer_id} ({name}) at {ip}")
+
+def prune_peers():
+    now = time.monotonic()
+    with peers_lock:
+        stale = [pid for pid, info in peers.items()
+                 if now - info["last_seen"] > PEER_TIMEOUT]
+        for pid in stale:
+            info = peers.pop(pid)
+            print(f"[peers] - left: {pid} ({info['name']}) at {info['ip']}")
+
+def print_peer_table():
+    with peers_lock:
+        print(f"[peers] online now: {len(peers)}")
+        for pid, info in peers.items():
+            age = time.monotonic() - info["last_seen"]
+            print(f"         {pid}  {info['name']}  {info['ip']}  (seen {age:.1f}s ago)")
 def announce_loop():
     while True:
         send_discovery_broadcast()
-        print("[announce] sent broadcast")
+        prune_peers()
+        print_peer_table()
         time.sleep(ANNOUNCE_INTERVAL)
 
 def listen_for_broadcasts():
@@ -47,7 +77,7 @@ def listen_for_broadcasts():
         if msg.get("id") == PEER_ID:
             continue  
 
-        print(f"[listen] peer {msg.get('id')} ({msg.get('name')}) at {addr[0]}")
+        update_peer(msg.get("id"), msg.get("name"), addr[0])
 
 def start_peer():
     print(f"[peer] my id is {PEER_ID}, name {PEER_NAME}")
