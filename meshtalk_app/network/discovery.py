@@ -1,21 +1,32 @@
 import socket
 import threading
 import time
+import json
+import uuid
 
 BROADCAST_PORT = 50000
-BROADCAST_MESSAGE = b"MESHTALK_HELLO"
 ANNOUNCE_INTERVAL = 3  
+
+PEER_ID = uuid.uuid4().hex[:8]   
+PEER_NAME = socket.gethostname()
+
+def build_message():
+    return json.dumps({
+        "type": "HELLO",
+        "id": PEER_ID,
+        "name": PEER_NAME,
+    }).encode()
 
 def send_discovery_broadcast():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.sendto(BROADCAST_MESSAGE, ('255.255.255.255', BROADCAST_PORT))
+    sock.sendto(build_message(), ('255.255.255.255', BROADCAST_PORT))
     sock.close()
 
 def announce_loop():
     while True:
         send_discovery_broadcast()
-        print(f"[announce] sent broadcast")
+        print("[announce] sent broadcast")
         time.sleep(ANNOUNCE_INTERVAL)
 
 def listen_for_broadcasts():
@@ -26,9 +37,21 @@ def listen_for_broadcasts():
 
     while True:
         data, addr = sock.recvfrom(1024)
-        print(f"[listen] received {data} from {addr}")
+
+        try:
+            msg = json.loads(data.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            print(f"[listen] ignored malformed packet from {addr}")
+            continue
+
+        if msg.get("id") == PEER_ID:
+            continue  
+
+        print(f"[listen] peer {msg.get('id')} ({msg.get('name')}) at {addr[0]}")
 
 def start_peer():
+    print(f"[peer] my id is {PEER_ID}, name {PEER_NAME}")
+
     listener_thread = threading.Thread(target=listen_for_broadcasts, daemon=True)
     listener_thread.start()
 
