@@ -88,10 +88,21 @@ def listen_for_broadcasts():
 
         update_peer(msg.get("id"), msg.get("name"), addr[0], msg.get("tcp_port"))
 
+def handle_client(conn, addr):
+    with conn:
+        data = conn.recv(4096)
+        if data:
+            print(f"[tcp] received {data!r} from {addr[0]}:{addr[1]}")
+
+def tcp_accept_loop(server):
+    while True:
+        conn, addr = server.accept()
+        threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
 def start_peer():
     global TCP_PORT
     tcp_server = create_tcp_server()
     TCP_PORT = tcp_server.getsockname()[1]
+    threading.Thread(target=tcp_accept_loop, args=(tcp_server,), daemon=True).start()
 
     print(f"[peer] my id is {PEER_ID}, name {PEER_NAME}, tcp port {TCP_PORT}")
 
