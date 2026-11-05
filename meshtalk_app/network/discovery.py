@@ -3,6 +3,7 @@ import threading
 import time
 import json
 import uuid
+import struct
 
 BROADCAST_PORT = 50000
 ANNOUNCE_INTERVAL = 3  
@@ -98,12 +99,42 @@ def listen_for_broadcasts():
         update_peer(msg.get("id"), msg.get("name"), addr[0], msg.get("tcp_port"))
 
 
+MAX_FRAME = 1_000_000
+
+def recv_exact(conn, n):
+    """Read exactly n bytes, or return None if the peer closes early."""
+    buf = b""
+    while len(buf) < n:
+        chunk = conn.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
 def handle_client(conn, addr):
     with conn:
-        data = conn.recv(4096)
-        if data:
-            print(f"[tcp] received {data!r} from {addr[0]}:{addr[1]}")
+        while True:
+            header = recv_exact(conn, 4)
+            if header is None:
+                return                      # peer closed the connection
+            (length,) = struct.unpack("!I", header)
 
+            if length > MAX_FRAME:
+                print(f"[tcp] rejected oversized frame ({length} bytes) from {addr[0]}")
+                return
+
+            body = recv_exact(conn, length)
+            if body is None:
+                return
+
+            try:
+                msg = json.loads(body.decode())
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                print(f"[tcp] malformed message from {addr[0]}")
+                return
+
+            print(f"[chat] {msg.get('from_name')} ({msg.get('from')}): {msg.get('text')}")
 
 def tcp_accept_loop(server):
     while True:
@@ -119,14 +150,23 @@ def send_message(peer_id, text):
         print(f"[send] unknown peer {peer_id}")
         return False
 
+    envelope = {
+        "type": "CHAT",
+        "from": PEER_ID,
+        "from_name": PEER_NAME,
+        "msg_id": uuid.uuid4().hex[:8],
+        "text": text,
+    }
+    body = json.dumps(envelope).encode()
+    frame = struct.pack("!I", len(body)) + body
+
     try:
         with socket.create_connection((info["ip"], info["tcp_port"]), timeout=3) as s:
-            s.sendall(text.encode())
+            s.sendall(frame)
         return True
     except OSError as e:
         print(f"[send] failed to reach {peer_id}: {e}")
         return False
-
 
 def command_loop():
     print("commands: peers | send <peer_id> <text> | quit")
