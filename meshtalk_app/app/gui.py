@@ -80,9 +80,7 @@ class MeshTalkApp:
         if pid is None:
             self.status.config(text="select a peer first")
             return
-        name = discovery.get_peers_snapshot().get(pid, {}).get("name", pid)
         threading.Thread(target=discovery.send_message, args=(pid, text), daemon=True).start()
-        self.append_chat(f"You -> {name} ({pid}): {text}")
         self.entry.delete(0, tk.END)
         self.status.config(text="")
 
@@ -96,6 +94,11 @@ class MeshTalkApp:
                 self.refresh_peers()
             elif e["kind"] == "chat":
                 self.append_chat(f"{e['sender_name']} ({e['sender_id']}): {e['text']}")
+            elif e["kind"] == "sent":
+                self.append_chat(f"You -> {e['name']} ({e['peer_id']}): {e['text']}")
+            elif e["kind"] == "send_failed":
+                self.append_chat(f"!! NOT DELIVERED to {e['name']} ({e['peer_id']}): {e['text']}")
+                self.status.config(text=f"failed to reach {e['name']}: {e['reason']}")    
             elif e["kind"] == "log":
                 self.status.config(text=e["text"])
         self.root.after(POLL_MS, self.poll_events)

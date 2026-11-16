@@ -150,7 +150,8 @@ def send_message(peer_id, text):
         info = peers.get(peer_id)
 
     if info is None:
-        emit("log", text=f"unknown peer {peer_id}")
+        emit("send_failed", peer_id=peer_id, name=peer_id, text=text,
+             reason="peer is no longer online")
         return False
 
     envelope = {
@@ -166,11 +167,11 @@ def send_message(peer_id, text):
     try:
         with socket.create_connection((info["ip"], info["tcp_port"]), timeout=3) as s:
             s.sendall(frame)
+        emit("sent", peer_id=peer_id, name=info["name"], text=text)
         return True
     except OSError as e:
-        emit("log", text=f"failed to reach {peer_id}: {e}")
+        emit("send_failed", peer_id=peer_id, name=info["name"], text=text, reason=str(e))
         return False
-
 
 def start_network():
     """Start all background network threads. Returns immediately."""
@@ -183,8 +184,7 @@ def start_network():
     threading.Thread(target=announce_loop, daemon=True).start()
 
 
-# ---------- temporary command-line front end ----------
-# The GUI will replace everything below this line.
+
 
 def print_events():
     while True:
