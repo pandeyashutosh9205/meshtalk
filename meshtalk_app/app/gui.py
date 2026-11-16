@@ -5,7 +5,7 @@ import tkinter as tk
 from meshtalk_app.network import discovery
 from meshtalk_app.network.events import events
 
-POLL_MS = 100  
+POLL_MS = 100   # how often the GUI checks the event queue
 
 
 class MeshTalkApp:
@@ -14,21 +14,30 @@ class MeshTalkApp:
         root.title("MeshTalk")
         root.geometry("800x500")
 
+        self.conversations = {}   # peer_id -> list of chat lines
+        self.unread = {}          # peer_id -> number of unread messages
+        self.current_peer = None  # peer_id of the open chat, or None
+        self.peer_ids = []        # row i in the listbox <-> peer id peer_ids[i]
+
         self.header = tk.Label(root, text="starting...", anchor="w")
         self.header.pack(fill="x", padx=8, pady=4)
 
         body = tk.Frame(root)
         body.pack(fill="both", expand=True, padx=8)
 
+        # left side: peer list
         left = tk.Frame(body)
         left.pack(side="left", fill="y")
         tk.Label(left, text="Peers online", anchor="w").pack(fill="x")
-        self.peer_list = tk.Listbox(left, width=34, exportselection=False)
+        self.peer_list = tk.Listbox(left, width=30, exportselection=False)
         self.peer_list.pack(fill="y", expand=True)
+        self.peer_list.bind("<<ListboxSelect>>", self.on_select)
 
+        # right side: chat title, chat area, send box
         right = tk.Frame(body)
         right.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        tk.Label(right, text="Chat", anchor="w").pack(fill="x")
+        self.chat_title = tk.Label(right, text="Select a peer to start chatting", anchor="w")
+        self.chat_title.pack(fill="x")
         self.chat = tk.Text(right, state="disabled", wrap="word")
         self.chat.pack(fill="both", expand=True)
 
@@ -42,47 +51,71 @@ class MeshTalkApp:
         self.status = tk.Label(root, text="", anchor="w")
         self.status.pack(fill="x", padx=8, pady=4)
 
-        self.peer_ids = []  
-
         discovery.start_network()
         self.header.config(
             text=f"You: {discovery.PEER_NAME} ({discovery.PEER_ID})   tcp port {discovery.TCP_PORT}"
         )
         self.poll_events()
 
-    def selected_peer_id(self):
-        sel = self.peer_list.curselection()
-        if not sel:
-            return None
-        return self.peer_ids[sel[0]]
+    # ---------- peer list ----------
 
     def refresh_peers(self):
-        keep = self.selected_peer_id()
         snap = discovery.get_peers_snapshot()
         self.peer_list.delete(0, tk.END)
         self.peer_ids = list(snap.keys())
         for i, (pid, info) in enumerate(snap.items()):
-            self.peer_list.insert(tk.END, f"{info['name']}  ({pid})  {info['ip']}")
-            if pid == keep:
+            n = self.unread.get(pid, 0)
+            badge = f"   [{n}]" if n else ""
+            self.peer_list.insert(tk.END, f"{info['name']}  ({pid}){badge}")
+            if pid == self.current_peer:
                 self.peer_list.selection_set(i)
 
-    def append_chat(self, line):
+    def on_select(self, event):
+        sel = self.peer_list.curselection()
+        if not sel:
+            return
+        self.current_peer = self.peer_ids[sel[0]]
+        self.unread[self.current_peer] = 0
+        name = discovery.get_peers_snapshot().get(self.current_peer, {}).get("name", "?")
+        self.chat_title.config(text=f"Chat with {name} ({self.current_peer})")
+        self.status.config(text="")
+        self.render_chat()
+        self.refresh_peers()
+
+    # ---------- chat area ----------
+
+    def render_chat(self):
         self.chat.config(state="normal")
-        self.chat.insert(tk.END, line + "\n")
+        self.chat.delete("1.0", tk.END)
+        for line in self.conversations.get(self.current_peer, []):
+            self.chat.insert(tk.END, line + "\n")
         self.chat.config(state="disabled")
         self.chat.see(tk.END)
+
+    def add_line(self, peer_id, line):
+        self.conversations.setdefault(peer_id, []).append(line)
+        if peer_id == self.current_peer:
+            self.chat.config(state="normal")
+            self.chat.insert(tk.END, line + "\n")
+            self.chat.config(state="disabled")
+            self.chat.see(tk.END)
+        else:
+            self.unread[peer_id] = self.unread.get(peer_id, 0) + 1
+            self.refresh_peers()
 
     def on_send(self):
         text = self.entry.get().strip()
         if not text:
             return
-        pid = self.selected_peer_id()
-        if pid is None:
+        if self.current_peer is None:
             self.status.config(text="select a peer first")
             return
-        threading.Thread(target=discovery.send_message, args=(pid, text), daemon=True).start()
+        threading.Thread(target=discovery.send_message,
+                         args=(self.current_peer, text), daemon=True).start()
         self.entry.delete(0, tk.END)
         self.status.config(text="")
+
+    # ---------- events from the network threads ----------
 
     def poll_events(self):
         while True:
@@ -90,16 +123,17 @@ class MeshTalkApp:
                 e = events.get_nowait()
             except queue.Empty:
                 break
-            if e["kind"] in ("peer_joined", "peer_left"):
+            kind = e["kind"]
+            if kind in ("peer_joined", "peer_left"):
                 self.refresh_peers()
-            elif e["kind"] == "chat":
-                self.append_chat(f"{e['sender_name']} ({e['sender_id']}): {e['text']}")
-            elif e["kind"] == "sent":
-                self.append_chat(f"You -> {e['name']} ({e['peer_id']}): {e['text']}")
-            elif e["kind"] == "send_failed":
-                self.append_chat(f"!! NOT DELIVERED to {e['name']} ({e['peer_id']}): {e['text']}")
-                self.status.config(text=f"failed to reach {e['name']}: {e['reason']}")    
-            elif e["kind"] == "log":
+            elif kind == "chat":
+                self.add_line(e["sender_id"], f"{e['sender_name']}: {e['text']}")
+            elif kind == "sent":
+                self.add_line(e["peer_id"], f"You: {e['text']}")
+            elif kind == "send_failed":
+                self.add_line(e["peer_id"], f"!! NOT DELIVERED: {e['text']}")
+                self.status.config(text=f"failed to reach {e['name']}: {e['reason']}")
+            elif kind == "log":
                 self.status.config(text=e["text"])
         self.root.after(POLL_MS, self.poll_events)
 
