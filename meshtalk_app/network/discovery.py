@@ -121,6 +121,8 @@ MAX_ACK = 1024     # an acknowledgement is tiny; refuse anything bigger
 def handle_group_create(msg):
     """Returns True if the invite was accepted, so the sender gets an ack."""
     gid = msg.get("group_id")
+    if not isinstance(gid, str):
+        return False
     name = msg.get("group_name")
     members = msg.get("members")
     if not gid or not name or not isinstance(members, list):
@@ -144,6 +146,8 @@ def handle_group_create(msg):
 def handle_group_msg(msg):
     """Returns True if the message was accepted, so the sender gets an ack."""
     gid = msg.get("group_id")
+    if not isinstance(gid, str):
+        return False
     with groups_lock:
         group = groups.get(gid)
     if group is None:
@@ -156,6 +160,22 @@ def handle_group_msg(msg):
          sender_name=msg.get("from_name"), text=msg.get("text"))
     return True
 
+def handle_typing(msg):
+    sender = msg.get("from")
+    scope = msg.get("scope")
+    if not sender or scope not in ("direct", "everyone", "group"):
+        return
+    group_id = None
+    if scope == "group":
+        group_id = msg.get("group_id")
+        if not isinstance(group_id, str):
+            return
+        with groups_lock:
+            group = groups.get(group_id)
+        if group is None or sender not in group["members"]:
+            return                      # same membership rule as group messages
+    emit("typing", sender_id=str(sender)[:16], sender_name=str(msg.get("from_name"))[:40],
+         scope=scope, group_id=group_id)
 
 def send_ack(conn, msg_id):
     body = json.dumps({"type": "ACK", "from": PEER_ID, "msg_id": msg_id}).encode()
@@ -196,6 +216,8 @@ def handle_client(conn, addr):
                 accepted = handle_group_create(msg)
             elif mtype == "GROUP_MSG":
                 accepted = handle_group_msg(msg)
+            elif mtype == "TYPING":
+                handle_typing(msg)
             elif mtype in ("CHAT", "GROUP"):
                 kind = "group_chat" if mtype == "GROUP" else "chat"
                 emit(kind, sender_id=msg.get("from"), sender_name=msg.get("from_name"),
@@ -297,7 +319,26 @@ def send_to_everyone(text):
         return
     _fan_out("everyone", _make_envelope("GROUP", text), targets)
 
+def _notify(info, envelope):
+    """Fire-and-forget: send one framed message and do not wait for any reply."""
+    body = json.dumps(envelope).encode()
+    frame = struct.pack("!I", len(body)) + body
+    try:
+        with socket.create_connection((info["ip"], info["tcp_port"]), timeout=1) as s:
+            s.sendall(frame)
+    except OSError:
+        pass        # a missed typing hint is not worth reporting
 
+
+def send_typing(peer_ids, scope, group_id=None):
+    snap = get_peers_snapshot()
+    envelope = {"type": "TYPING", "from": PEER_ID, "from_name": PEER_NAME, "scope": scope}
+    if group_id:
+        envelope["group_id"] = group_id
+    for pid in peer_ids:
+        info = snap.get(pid)
+        if info is not None:
+            _notify(info, envelope)
 def get_groups_snapshot():
     with groups_lock:
         return {gid: dict(g) for gid, g in groups.items()}

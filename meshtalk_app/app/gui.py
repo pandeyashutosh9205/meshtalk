@@ -8,6 +8,11 @@ from meshtalk_app.network.events import events
 
 POLL_MS = 100   # how often the GUI checks the event queue
 
+TYPING_EVERY = 2.0   # send at most one "typing" hint per conversation this often
+TYPING_TTL = 4.0     # forget a "typing" hint if no newer one arrives in this long
+IGNORED_KEYS = {"Return", "Shift_L", "Shift_R", "Control_L", "Control_R",
+                "Alt_L", "Alt_R", "Caps_Lock", "Tab"}   # these don't count as typing
+
 EVERYONE = "everyone"   # reserved conversation id for the Everyone channel
 GROUP_PREFIX = "g:"     # group conversations are stored as "g:<group id>"
                         # (peer ids are plain hex, so they can never start with "g:")
@@ -67,6 +72,11 @@ class MeshTalkApp:
         self.current_peer = EVERYONE  # open conversation id
         self.row_ids = [EVERYONE]     # row i in the listbox <-> conversation id row_ids[i]
 
+        self.typing = {}              # conversation id -> {sender_id: (name, expires_at)}
+        self.last_typing_sent = {}    # conversation id -> when we last announced typing
+        self.sound_on = True
+        self.last_sound = 0.0
+
         self.build_top_bar()
 
         self.status = tk.Label(root, text="", anchor="w", bg=CHAT_BG, fg=MUTED,
@@ -96,6 +106,10 @@ class MeshTalkApp:
         self.port_label.pack(side="right", padx=(0, 16))
         self.id_label = tk.Label(bar, bg=SIDEBAR_BG, fg=SIDEBAR_TEXT, font=(FONT, 10))
         self.id_label.pack(side="right", padx=(0, 10))
+        self.sound_label = tk.Label(bar, text="Sound on", bg=SIDEBAR_BG,
+                                    fg=SIDEBAR_MUTED, font=(FONT, 9), cursor="hand2")
+        self.sound_label.pack(side="right", padx=(0, 16))
+        self.sound_label.bind("<Button-1>", lambda event: self.toggle_sound())
 
     def build_sidebar(self, parent):
         side = tk.Frame(parent, bg=SIDEBAR_BG, width=270)
@@ -146,6 +160,7 @@ class MeshTalkApp:
             highlightbackground=BORDER, highlightcolor=ACCENT)
         self.entry.pack(side="left", fill="x", expand=True, ipady=8)
         self.entry.bind("<Return>", lambda event: self.on_send())
+        self.entry.bind("<KeyRelease>", self.on_key)
         send_btn = tk.Button(
             send_row, text="Send", font=(FONT_BOLD, 10), bg=ACCENT, fg="white",
             activebackground=ACCENT_DARK, activeforeground="white",
@@ -153,6 +168,12 @@ class MeshTalkApp:
         send_btn.pack(side="left", fill="y", padx=(8, 0))
         send_btn.bind("<Enter>", lambda event: send_btn.config(bg=ACCENT_DARK))
         send_btn.bind("<Leave>", lambda event: send_btn.config(bg=ACCENT))
+
+        # packed right after the send row, so it sits just above it; always one line
+        # tall (even when empty), so the layout never jumps when it fills in
+        self.typing_label = tk.Label(pane, text="", anchor="w", bg=CHAT_BG, fg=MUTED,
+                                     font=(FONT, 9, "italic"))
+        self.typing_label.pack(side="bottom", fill="x", padx=16)
 
         text_frame = tk.Frame(pane, bg=CHAT_BG)
         text_frame.pack(side="top", fill="both", expand=True)
@@ -239,6 +260,7 @@ class MeshTalkApp:
         self.status.config(text="")
         self.render_chat()
         self.refresh_peers()
+        self.update_typing_label()
         self.entry.focus_set()
 
     def update_header(self):
@@ -363,6 +385,11 @@ class MeshTalkApp:
             self.unread[conv_id] = self.unread.get(conv_id, 0) + 1
             self.refresh_peers()
 
+        # beep for incoming messages you can't currently see
+        if msg["kind"] == "them" and (conv_id != self.current_peer
+                                      or self.root.focus_displayof() is None):
+            self.play_sound()
+
     def on_send(self):
         text = self.entry.get().strip()
         if not text:
@@ -377,6 +404,83 @@ class MeshTalkApp:
         threading.Thread(target=target, args=args, daemon=True).start()
         self.entry.delete(0, tk.END)
         self.status.config(text="")
+
+    # ---------- typing indicator ----------
+
+    def typing_targets(self):
+        """Who should hear that we're typing in the open conversation."""
+        cid = self.current_peer
+        if cid == EVERYONE:
+            return list(self.online_ids), "everyone", None
+        if cid.startswith(GROUP_PREFIX):
+            gid = cid[len(GROUP_PREFIX):]
+            group = self.groups.get(gid)
+            if group is None:
+                return [], "group", gid
+            return [m for m in group["members"] if m != discovery.PEER_ID], "group", gid
+        return [cid], "direct", None
+
+    def on_key(self, event):
+        if event.keysym in IGNORED_KEYS:
+            return
+        if not self.entry.get().strip():
+            return                        # an empty box is not "typing"
+        cid = self.current_peer
+        now = time.monotonic()
+        if now - self.last_typing_sent.get(cid, 0.0) < TYPING_EVERY:
+            return                        # throttle: one hint per conversation per 2 s
+        self.last_typing_sent[cid] = now
+        targets, scope, gid = self.typing_targets()
+        if targets:
+            threading.Thread(target=discovery.send_typing,
+                             args=(targets, scope, gid), daemon=True).start()
+
+    def on_typing_event(self, e):
+        if e["scope"] == "direct":
+            conv = e["sender_id"]
+        elif e["scope"] == "group":
+            conv = GROUP_PREFIX + e["group_id"]
+        else:
+            conv = EVERYONE
+        self.typing.setdefault(conv, {})[e["sender_id"]] = (
+            e["sender_name"], time.monotonic() + TYPING_TTL)
+
+    def clear_typing(self, conv, sender_id):
+        self.typing.get(conv, {}).pop(sender_id, None)
+
+    def update_typing_label(self):
+        now = time.monotonic()
+        who = self.typing.get(self.current_peer, {})
+        for sid in [s for s, (_, expires) in who.items() if expires < now]:
+            del who[sid]
+        names = [name for name, _ in who.values()]
+        if not names:
+            text = ""
+        elif len(names) == 1:
+            text = f"{names[0]} is typing..."
+        elif len(names) == 2:
+            text = f"{names[0]} and {names[1]} are typing..."
+        else:
+            text = f"{len(names)} people are typing..."
+        if text != self.typing_label.cget("text"):
+            self.typing_label.config(text=text)
+
+    # ---------- sound ----------
+
+    def toggle_sound(self):
+        self.sound_on = not self.sound_on
+        self.sound_label.config(text="Sound on" if self.sound_on else "Sound off")
+
+    def play_sound(self):
+        now = time.monotonic()
+        if not self.sound_on or now - self.last_sound < 1.0:
+            return                        # muted, or too soon after the last beep
+        self.last_sound = now
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)   # plays without blocking
+        except Exception:
+            self.root.bell()              # non-Windows fallback
 
     # ---------- new group dialog ----------
 
@@ -449,14 +553,19 @@ class MeshTalkApp:
                 self.refresh_peers()
             elif kind == "chat":
                 self.names.setdefault(e["sender_id"], e["sender_name"])
+                self.clear_typing(e["sender_id"], e["sender_id"])
                 self.add_message(e["sender_id"], new_msg("them", e["text"]))
             elif kind == "group_chat":
+                self.clear_typing(EVERYONE, e["sender_id"])
                 who = f"{e['sender_name']} ({e['sender_id']})"
                 self.add_message(EVERYONE, new_msg("them", e["text"], who=who))
             elif kind == "group_msg":
+                self.clear_typing(GROUP_PREFIX + e["group_id"], e["sender_id"])
                 who = f"{e['sender_name']} ({e['sender_id']})"
                 self.add_message(GROUP_PREFIX + e["group_id"],
                                  new_msg("them", e["text"], who=who))
+            elif kind == "typing":
+                self.on_typing_event(e)
             elif kind == "out_start":
                 self.on_out_start(e)
             elif kind == "out_reach":
@@ -473,6 +582,7 @@ class MeshTalkApp:
                 self.handle_group_created(e)
             elif kind == "log":
                 self.status.config(text=e["text"])
+        self.update_typing_label()
         self.root.after(POLL_MS, self.poll_events)
 
     def on_out_start(self, e):
