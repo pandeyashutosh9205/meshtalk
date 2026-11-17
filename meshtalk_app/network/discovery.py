@@ -114,39 +114,56 @@ def recv_exact(conn, n):
         buf += chunk
     return buf
 
+ACK_TIMEOUT = 2    # seconds to wait for the receiver's acknowledgement
+MAX_ACK = 1024     # an acknowledgement is tiny; refuse anything bigger
+
+
 def handle_group_create(msg):
+    """Returns True if the invite was accepted, so the sender gets an ack."""
     gid = msg.get("group_id")
     name = msg.get("group_name")
     members = msg.get("members")
     if not gid or not name or not isinstance(members, list):
         emit("log", text="ignored malformed group invite")
-        return
+        return False
 
     name = str(name)[:40]                       # cap sizes so a peer can't flood us
     members = [str(m) for m in members][:50]
 
     if PEER_ID not in members or msg.get("from") not in members:
-        return                                  # not for us, or the creator isn't a member
+        return False                            # not for us, or the creator isn't a member
 
     with groups_lock:
         if gid in groups:
-            return                              # never let a repeat invite rewrite a group
+            return True                         # already have it; a repeat invite changes nothing
         groups[gid] = {"name": name, "members": members, "owner": msg.get("from")}
     emit("group_created", group_id=gid, name=name, members=members, failed=[])
+    return True
 
 
 def handle_group_msg(msg):
+    """Returns True if the message was accepted, so the sender gets an ack."""
     gid = msg.get("group_id")
     with groups_lock:
         group = groups.get(gid)
     if group is None:
         emit("log", text="ignored message for an unknown group")
-        return
+        return False
     if msg.get("from") not in group["members"]:
         emit("log", text=f"ignored group message from non-member {msg.get('from')}")
-        return
+        return False
     emit("group_msg", group_id=gid, sender_id=msg.get("from"),
          sender_name=msg.get("from_name"), text=msg.get("text"))
+    return True
+
+
+def send_ack(conn, msg_id):
+    body = json.dumps({"type": "ACK", "from": PEER_ID, "msg_id": msg_id}).encode()
+    try:
+        conn.sendall(struct.pack("!I", len(body)) + body)
+    except OSError:
+        pass    # the sender already gave up and closed the connection
+
 
 def handle_client(conn, addr):
     with conn:
@@ -171,23 +188,29 @@ def handle_client(conn, addr):
                 return
 
             if not isinstance(msg, dict):
-                return                          # valid JSON, but not a message object
+                return
 
             mtype = msg.get("type")
+            accepted = False
             if mtype == "GROUP_CREATE":
-                handle_group_create(msg)
+                accepted = handle_group_create(msg)
             elif mtype == "GROUP_MSG":
-                handle_group_msg(msg)
-            else:
+                accepted = handle_group_msg(msg)
+            elif mtype in ("CHAT", "GROUP"):
                 kind = "group_chat" if mtype == "GROUP" else "chat"
                 emit(kind, sender_id=msg.get("from"), sender_name=msg.get("from_name"),
                      msg_id=msg.get("msg_id"), text=msg.get("text"))
+                accepted = True
+
+            if accepted and msg.get("msg_id"):
+                send_ack(conn, msg["msg_id"])
 
 
 def tcp_accept_loop(server):
     while True:
         conn, addr = server.accept()
         threading.Thread(target=handle_client, args=(conn, addr), daemon=True).start()
+
 
 def _make_envelope(kind, text):
     return {
@@ -199,46 +222,80 @@ def _make_envelope(kind, text):
     }
 
 
-def _deliver(info, envelope):
-    """Send one framed message to one peer. Returns None on success, or an error string."""
+def _wait_for_ack(sock, msg_id):
+    """Read one ACK frame from the connection. True only if it confirms msg_id."""
+    try:
+        sock.settimeout(ACK_TIMEOUT)
+        header = recv_exact(sock, 4)
+        if header is None:
+            return False
+        (length,) = struct.unpack("!I", header)
+        if length > MAX_ACK:
+            return False
+        body = recv_exact(sock, length)
+        if body is None:
+            return False
+        reply = json.loads(body.decode())
+        return (isinstance(reply, dict) and reply.get("type") == "ACK"
+                and reply.get("msg_id") == msg_id)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+
+
+def _deliver(info, envelope, on_sent=None):
+    """Send one framed message to one peer.
+    Returns (error, acked): error is None once the bytes were written,
+    and acked is True if the receiver confirmed it."""
     body = json.dumps(envelope).encode()
     frame = struct.pack("!I", len(body)) + body
     try:
         with socket.create_connection((info["ip"], info["tcp_port"]), timeout=3) as s:
             s.sendall(frame)
-        return None
+            if on_sent:
+                on_sent()                       # lets the GUI show the first tick now
+            return None, _wait_for_ack(s, envelope["msg_id"])
     except OSError as e:
-        return str(e)
+        return str(e), False
+
+
+def _fan_out(scope, envelope, targets, peer_id=None, group_id=None):
+    """Send one envelope to several peers and report progress as events.
+    targets is a list of (peer_id, info or None, display name)."""
+    msg_id = envelope["msg_id"]
+    emit("out_start", scope=scope, peer_id=peer_id, group_id=group_id,
+         msg_id=msg_id, text=envelope["text"], total=len(targets))
+
+    for pid, info, name in targets:
+        if info is None:
+            emit("out_fail", msg_id=msg_id, peer_id=pid, name=name,
+                 reason="peer is no longer online")
+            continue
+        error, acked = _deliver(
+            info, envelope,
+            on_sent=lambda p=pid: emit("out_reach", msg_id=msg_id, peer_id=p))
+        if error is not None:
+            emit("out_fail", msg_id=msg_id, peer_id=pid, name=name, reason=error)
+        elif acked:
+            emit("out_ack", msg_id=msg_id, peer_id=pid)
+
+    emit("out_done", msg_id=msg_id)
 
 
 def send_message(peer_id, text):
     with peers_lock:
         info = peers.get(peer_id)
-
-    if info is None:
-        emit("send_failed", peer_id=peer_id, name=peer_id, text=text,
-             reason="peer is no longer online")
-        return False
-
-    error = _deliver(info, _make_envelope("CHAT", text))
-    if error is None:
-        emit("sent", peer_id=peer_id, name=info["name"], text=text)
-        return True
-
-    emit("send_failed", peer_id=peer_id, name=info["name"], text=text, reason=error)
-    return False
+    name = info["name"] if info else peer_id
+    _fan_out("direct", _make_envelope("CHAT", text), [(peer_id, info, name)],
+             peer_id=peer_id)
 
 
 def send_to_everyone(text):
     snap = get_peers_snapshot()
-    envelope = _make_envelope("GROUP", text)   # one message, one msg_id, for everybody
-    delivered, failed = [], []
-    for pid, info in snap.items():
-        if _deliver(info, envelope) is None:
-            delivered.append(pid)
-        else:
-            failed.append(f"{info['name']} ({pid})")
-    emit("group_sent", text=text, delivered=delivered, failed=failed)
+    targets = [(pid, info, info["name"]) for pid, info in snap.items()]
+    if not targets:
+        emit("log", text="Nobody else is online, so no one received that")
+        return
+    _fan_out("everyone", _make_envelope("GROUP", text), targets)
 
 
 def get_groups_snapshot():
@@ -261,7 +318,8 @@ def create_group(name, member_ids):
             continue
         envelope = _make_envelope("GROUP_CREATE", "")
         envelope.update({"group_id": gid, "group_name": name, "members": members})
-        if _deliver(info, envelope) is not None:
+        error, _ = _deliver(info, envelope)
+        if error is not None:
             failed.append(f"{info['name']} ({pid})")
 
     emit("group_created", group_id=gid, name=name, members=members, failed=failed)
@@ -279,20 +337,17 @@ def send_group_message(group_id, text):
     envelope = _make_envelope("GROUP_MSG", text)
     envelope["group_id"] = group_id
 
-    delivered, failed = [], []
+    targets = []
     for pid in group["members"]:
         if pid == PEER_ID:
             continue
         info = snap.get(pid)
-        if info is None:
-            failed.append(pid)                  # member is offline
-        elif _deliver(info, envelope) is None:
-            delivered.append(pid)
-        else:
-            failed.append(f"{info['name']} ({pid})")
+        targets.append((pid, info, info["name"] if info else pid))
+    if not targets:
+        emit("log", text="there is nobody else in this group")
+        return
+    _fan_out("group", envelope, targets, group_id=group_id)
 
-    emit("group_msg_sent", group_id=group_id, text=text,
-         delivered=delivered, failed=failed)
 def start_network():
     """Start all background network threads. Returns immediately."""
     global TCP_PORT
@@ -302,48 +357,3 @@ def start_network():
     threading.Thread(target=tcp_accept_loop, args=(tcp_server,), daemon=True).start()
     threading.Thread(target=listen_for_broadcasts, daemon=True).start()
     threading.Thread(target=announce_loop, daemon=True).start()
-
-
-
-
-def print_events():
-    while True:
-        e = events.get()
-        kind = e["kind"]
-        if kind == "peer_joined":
-            print(f"[peers] + joined: {e['peer_id']} ({e['name']}) at {e['ip']}:{e['tcp_port']}")
-        elif kind == "peer_left":
-            print(f"[peers] - left: {e['peer_id']} ({e['name']}) at {e['ip']}")
-        elif kind == "chat":
-            print(f"[chat] {e['sender_name']} ({e['sender_id']}): {e['text']}")
-        elif kind == "log":
-            print(f"[log] {e['text']}")
-
-
-def command_loop():
-    print("commands: peers | send <peer_id> <text> | quit")
-    while True:
-        line = input("> ").strip()
-        if line == "peers":
-            snap = get_peers_snapshot()
-            print(f"[peers] online now: {len(snap)}")
-            for pid, info in snap.items():
-                age = time.monotonic() - info["last_seen"]
-                print(f"         {pid}  {info['name']}  {info['ip']}:{info['tcp_port']}  (seen {age:.1f}s ago)")
-        elif line.startswith("send "):
-            parts = line.split(" ", 2)
-            if len(parts) < 3:
-                print("usage: send <peer_id> <text>")
-                continue
-            send_message(parts[1], parts[2])
-        elif line == "quit":
-            break
-        elif line:
-            print("unknown command")
-
-
-if __name__ == "__main__":
-    start_network()
-    print(f"[peer] my id is {PEER_ID}, name {PEER_NAME}, tcp port {TCP_PORT}")
-    threading.Thread(target=print_events, daemon=True).start()
-    command_loop()

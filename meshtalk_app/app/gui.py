@@ -35,6 +35,21 @@ FAIL_BG = "#FBE3E0"
 FAIL_FG = "#9A2A1F"
 
 
+def new_msg(kind, text, who="", msg_id=None, total=0):
+    """One chat entry. Outgoing messages also track who they reached / who confirmed."""
+    return {
+        "kind": kind,            # "me", "them", "failed" or "system"
+        "text": text,
+        "stamp": time.strftime("%H:%M"),
+        "who": who,
+        "msg_id": msg_id,
+        "total": total,          # how many recipients this message was sent to
+        "reached": set(),        # peers whose connection accepted the bytes
+        "acked": set(),          # peers that confirmed with an ACK
+        "failed": [],            # (name, peer_id, reason)
+    }
+
+
 class MeshTalkApp:
     def __init__(self, root):
         self.root = root
@@ -43,7 +58,8 @@ class MeshTalkApp:
         root.minsize(680, 420)
         root.configure(bg=CHAT_BG)
 
-        self.conversations = {}       # conversation id -> list of (kind, text, time, who)
+        self.conversations = {}       # conversation id -> list of message dicts
+        self.outgoing = {}            # msg_id -> (conversation id, message dict) while sending
         self.unread = {}              # conversation id -> number of unread messages
         self.names = {}               # peer_id -> last known name
         self.groups = {}              # group_id -> {"name", "members", "owner"} (cached)
@@ -167,6 +183,9 @@ class MeshTalkApp:
                                 font=bubble, spacing1=10, **right)
         self.chat.tag_configure("failed_time", foreground=FAIL_FG, font=small,
                                 spacing1=2, **right)
+        # delivery status text that follows the time under your own bubbles
+        self.chat.tag_configure("tick_sent", foreground=MUTED, font=small)
+        self.chat.tag_configure("tick_done", foreground=ACCENT, font=(FONT_BOLD, 8))
         self.chat.tag_configure("system", foreground=MUTED, font=(FONT, 9),
                                 justify="center", spacing1=12)
         self.chat.tag_configure("empty", foreground=MUTED, font=(FONT, 11),
@@ -264,47 +283,83 @@ class MeshTalkApp:
 
     # ---------- chat area ----------
 
-    def draw(self, kind, text, stamp, who=""):
+    def delivery_status(self, msg):
+        """Text and tag for the line under one of your own bubbles."""
+        total, reached, acked = msg["total"], len(msg["reached"]), len(msg["acked"])
+        if total == 1:
+            if acked:
+                return "✓✓ Delivered", "tick_done"
+            if reached:
+                return "✓ Sent", "tick_sent"
+            return "Sending...", "tick_sent"
+        if acked == total:
+            return "✓✓ Delivered to all", "tick_done"
+        if acked:
+            return f"✓ Delivered to {acked} of {total}", "tick_sent"
+        if reached:
+            return "✓ Sent", "tick_sent"
+        return "Sending...", "tick_sent"
+
+    def draw(self, msg):
+        kind, stamp = msg["kind"], msg["stamp"]
         if kind == "system":
-            self.chat.insert(tk.END, text, "system")
+            self.chat.insert(tk.END, msg["text"], "system")
             self.chat.insert(tk.END, "\n")
             return
-        label = f"{who}, {stamp}" if who else stamp
+
         if kind == "me":
-            tag, time_tag, caption = "me", "me_time", label
+            bubble_tag = "me"
         elif kind == "them":
-            tag, time_tag, caption = "them", "them_time", label
+            bubble_tag = "them"
         else:
-            tag, time_tag, caption = "failed", "failed_time", f"Not delivered, {stamp}"
-        self.chat.insert(tk.END, f"  {text}  ", tag)   # spaces act as bubble padding
-        self.chat.insert(tk.END, "\n")
-        self.chat.insert(tk.END, caption, time_tag)
+            bubble_tag = "failed"
+        self.chat.insert(tk.END, f"  {msg['text']}  ", bubble_tag)   # spaces = padding
         self.chat.insert(tk.END, "\n")
 
-    def render_chat(self):
+        if kind == "me":
+            self.chat.insert(tk.END, f"{stamp}  ", "me_time")
+            status, tick_tag = self.delivery_status(msg)
+            self.chat.insert(tk.END, status, tick_tag)
+        elif kind == "them":
+            label = f"{msg['who']}, {stamp}" if msg["who"] else stamp
+            self.chat.insert(tk.END, label, "them_time")
+        else:
+            self.chat.insert(tk.END, f"Not delivered, {stamp}", "failed_time")
+        self.chat.insert(tk.END, "\n")
+
+    def render_chat(self, keep_scroll=False):
+        if keep_scroll:
+            first, last = self.chat.yview()
+            at_bottom = last >= 0.999
         self.chat.config(state="normal")
         self.chat.delete("1.0", tk.END)
         msgs = self.conversations.get(self.current_peer, [])
         if not msgs:
             self.chat.insert(tk.END, "No messages yet. Say hello.", "empty")
-        for kind, text, stamp, who in msgs:
-            self.draw(kind, text, stamp, who)
+        for msg in msgs:
+            self.draw(msg)
         self.chat.config(state="disabled")
-        self.chat.see(tk.END)
+        if keep_scroll and not at_bottom:
+            self.chat.yview_moveto(first)    # don't yank someone reading old messages
+        else:
+            self.chat.see(tk.END)
 
-    def add_message(self, conv_id, kind, text, who=""):
-        stamp = time.strftime("%H:%M")
+    def redraw_if_open(self, conv_id):
+        if conv_id == self.current_peer:
+            self.render_chat(keep_scroll=True)
+
+    def add_message(self, conv_id, msg):
         msgs = self.conversations.setdefault(conv_id, [])
-        msgs.append((kind, text, stamp, who))
+        msgs.append(msg)
         if conv_id == self.current_peer:
             if len(msgs) == 1:
                 self.render_chat()   # replaces the "No messages yet" hint
             else:
                 self.chat.config(state="normal")
-                self.draw(kind, text, stamp, who)
+                self.draw(msg)
                 self.chat.config(state="disabled")
                 self.chat.see(tk.END)
-        elif kind == "them":
+        elif msg["kind"] == "them":
             self.unread[conv_id] = self.unread.get(conv_id, 0) + 1
             self.refresh_peers()
 
@@ -394,40 +449,67 @@ class MeshTalkApp:
                 self.refresh_peers()
             elif kind == "chat":
                 self.names.setdefault(e["sender_id"], e["sender_name"])
-                self.add_message(e["sender_id"], "them", e["text"])
+                self.add_message(e["sender_id"], new_msg("them", e["text"]))
             elif kind == "group_chat":
                 who = f"{e['sender_name']} ({e['sender_id']})"
-                self.add_message(EVERYONE, "them", e["text"], who)
+                self.add_message(EVERYONE, new_msg("them", e["text"], who=who))
             elif kind == "group_msg":
                 who = f"{e['sender_name']} ({e['sender_id']})"
-                self.add_message(GROUP_PREFIX + e["group_id"], "them", e["text"], who)
-            elif kind == "sent":
-                self.add_message(e["peer_id"], "me", e["text"])
-            elif kind == "group_sent":
-                self.report_fanout(EVERYONE, e)
-            elif kind == "group_msg_sent":
-                self.report_fanout(GROUP_PREFIX + e["group_id"], e)
+                self.add_message(GROUP_PREFIX + e["group_id"],
+                                 new_msg("them", e["text"], who=who))
+            elif kind == "out_start":
+                self.on_out_start(e)
+            elif kind == "out_reach":
+                self.on_out_progress(e, "reached")
+            elif kind == "out_ack":
+                self.on_out_progress(e, "acked")
+            elif kind == "out_fail":
+                rec = self.outgoing.get(e["msg_id"])
+                if rec:
+                    rec[1]["failed"].append((e["name"], e["peer_id"], e["reason"]))
+            elif kind == "out_done":
+                self.on_out_done(e)
             elif kind == "group_created":
                 self.handle_group_created(e)
-            elif kind == "send_failed":
-                self.add_message(e["peer_id"], "failed", e["text"])
-                self.status.config(text=f"Could not reach {e['name']}: {e['reason']}")
             elif kind == "log":
                 self.status.config(text=e["text"])
         self.root.after(POLL_MS, self.poll_events)
 
-    def report_fanout(self, conv_id, e):
-        d, f = len(e["delivered"]), len(e["failed"])
-        if d == 0 and f == 0:
-            self.status.config(text="Nobody else is online, so no one received that")
-        elif d == 0:
-            self.add_message(conv_id, "failed", e["text"])
-            self.status.config(text="Could not reach anyone: " + ", ".join(e["failed"]))
+    def on_out_start(self, e):
+        if e["scope"] == "direct":
+            conv = e["peer_id"]
+        elif e["scope"] == "group":
+            conv = GROUP_PREFIX + e["group_id"]
         else:
-            note = f"Delivered to {d}" + (f", failed for {f}" if f else "")
-            self.add_message(conv_id, "me", e["text"], note)
-            if f:
-                self.status.config(text="Could not reach: " + ", ".join(e["failed"]))
+            conv = EVERYONE
+        msg = new_msg("me", e["text"], msg_id=e["msg_id"], total=e["total"])
+        self.outgoing[e["msg_id"]] = (conv, msg)
+        self.add_message(conv, msg)
+
+    def on_out_progress(self, e, field):
+        rec = self.outgoing.get(e["msg_id"])
+        if rec is None:
+            return
+        conv, msg = rec
+        msg[field].add(e["peer_id"])
+        self.redraw_if_open(conv)
+
+    def on_out_done(self, e):
+        rec = self.outgoing.pop(e["msg_id"], None)
+        if rec is None:
+            return
+        conv, msg = rec
+        missed = ", ".join(f"{n} ({p})" for n, p, _ in msg["failed"])
+        if not msg["reached"]:
+            msg["kind"] = "failed"           # nobody got it: turn the bubble red
+            if msg["total"] == 1 and msg["failed"]:
+                name, _, reason = msg["failed"][0]
+                self.status.config(text=f"Could not reach {name}: {reason}")
+            else:
+                self.status.config(text=f"Could not reach anyone: {missed}")
+        elif msg["failed"]:
+            self.status.config(text=f"Could not reach: {missed}")
+        self.redraw_if_open(conv)
 
     def handle_group_created(self, e):
         cid = GROUP_PREFIX + e["group_id"]
@@ -441,7 +523,7 @@ class MeshTalkApp:
             text = f"You created {e['name']}"
         else:
             text = f"{self.names.get(owner, owner)} added you to {e['name']}"
-        self.add_message(cid, "system", text)
+        self.add_message(cid, new_msg("system", text))
         if e["failed"]:
             self.status.config(text="Group created, but could not invite: "
                                + ", ".join(e["failed"]))
