@@ -8,8 +8,9 @@ from meshtalk_app.network.events import events
 
 POLL_MS = 100   # how often the GUI checks the event queue
 
-EVERYONE = "everyone"   # reserved conversation id for the group channel
-                        # (real peer ids are hex, so they can never equal this)
+EVERYONE = "everyone"   # reserved conversation id for the Everyone channel
+GROUP_PREFIX = "g:"     # group conversations are stored as "g:<group id>"
+                        # (peer ids are plain hex, so they can never start with "g:")
 
 # ---------- design tokens: change the look of the whole app here ----------
 FONT = "Segoe UI"
@@ -42,11 +43,13 @@ class MeshTalkApp:
         root.minsize(680, 420)
         root.configure(bg=CHAT_BG)
 
-        self.conversations = {}      # conversation id -> list of (kind, text, time, who)
-        self.unread = {}             # conversation id -> number of unread messages
-        self.names = {}              # peer_id -> last known name
-        self.current_peer = EVERYONE # open conversation: EVERYONE or a peer id
-        self.peer_ids = [EVERYONE]   # row i in the listbox <-> id peer_ids[i]
+        self.conversations = {}       # conversation id -> list of (kind, text, time, who)
+        self.unread = {}              # conversation id -> number of unread messages
+        self.names = {}               # peer_id -> last known name
+        self.groups = {}              # group_id -> {"name", "members", "owner"} (cached)
+        self.online_ids = set()       # peer ids currently in the peer table
+        self.current_peer = EVERYONE  # open conversation id
+        self.row_ids = [EVERYONE]     # row i in the listbox <-> conversation id row_ids[i]
 
         self.build_top_bar()
 
@@ -86,6 +89,15 @@ class MeshTalkApp:
         self.peers_label = tk.Label(side, text="People on this network", anchor="w",
                                     bg=SIDEBAR_BG, fg=SIDEBAR_MUTED, font=(FONT, 9))
         self.peers_label.pack(fill="x", padx=16, pady=(10, 6))
+
+        # the button is packed before the list so it keeps its space at the bottom
+        new_btn = tk.Button(
+            side, text="New group", font=(FONT_BOLD, 10), bg=SIDEBAR_SELECT,
+            fg="white", activebackground=ACCENT, activeforeground="white",
+            relief="flat", bd=0, pady=8, cursor="hand2", command=self.open_group_dialog)
+        new_btn.pack(side="bottom", fill="x", padx=12, pady=12)
+        new_btn.bind("<Enter>", lambda event: new_btn.config(bg=ACCENT))
+        new_btn.bind("<Leave>", lambda event: new_btn.config(bg=SIDEBAR_SELECT))
 
         self.peer_list = tk.Listbox(
             side, bg=SIDEBAR_BG, fg=SIDEBAR_TEXT, font=(FONT, 12),
@@ -155,34 +167,43 @@ class MeshTalkApp:
                                 font=bubble, spacing1=10, **right)
         self.chat.tag_configure("failed_time", foreground=FAIL_FG, font=small,
                                 spacing1=2, **right)
+        self.chat.tag_configure("system", foreground=MUTED, font=(FONT, 9),
+                                justify="center", spacing1=12)
         self.chat.tag_configure("empty", foreground=MUTED, font=(FONT, 11),
                                 justify="center", spacing1=80)
 
-    # ---------- peer list ----------
+    # ---------- sidebar list ----------
 
     def refresh_peers(self):
         snap = discovery.get_peers_snapshot()
-        self.peer_list.delete(0, tk.END)
-        self.peer_ids = [EVERYONE] + list(snap.keys())
+        self.groups = discovery.get_groups_snapshot()
+        self.online_ids = set(snap)
 
-        for i, pid in enumerate(self.peer_ids):
-            if pid == EVERYONE:
+        self.peer_list.delete(0, tk.END)
+        self.row_ids = ([EVERYONE]
+                        + [GROUP_PREFIX + gid for gid in self.groups]
+                        + list(snap.keys()))
+
+        for i, rid in enumerate(self.row_ids):
+            if rid == EVERYONE:
                 label = "Everyone"
+            elif rid.startswith(GROUP_PREFIX):
+                label = f"Group: {self.groups[rid[len(GROUP_PREFIX):]]['name']}"
             else:
-                info = snap[pid]
-                self.names[pid] = info["name"]
-                label = f"{info['name']}  {pid}"
-            n = self.unread.get(pid, 0)
+                info = snap[rid]
+                self.names[rid] = info["name"]
+                label = f"{info['name']}  {rid}"
+            n = self.unread.get(rid, 0)
             suffix = f"    {n} new" if n else ""
             self.peer_list.insert(tk.END, f"  {label}{suffix}")
             if n:
                 self.peer_list.itemconfig(i, fg=UNREAD_TEXT)
-            if pid == self.current_peer:
+            if rid == self.current_peer:
                 self.peer_list.selection_set(i)
 
         if not snap:
             # placeholder row: not a real conversation, so it must not look selectable
-            row = len(self.peer_ids)
+            row = len(self.row_ids)
             self.peer_list.insert(tk.END, "  Looking for peers...")
             self.peer_list.itemconfig(row, fg=SIDEBAR_MUTED,
                                       selectbackground=SIDEBAR_BG,
@@ -192,9 +213,9 @@ class MeshTalkApp:
 
     def on_select(self, event):
         sel = self.peer_list.curselection()
-        if not sel or sel[0] >= len(self.peer_ids):
+        if not sel or sel[0] >= len(self.row_ids):
             return   # nothing selected, or the placeholder row
-        self.current_peer = self.peer_ids[sel[0]]
+        self.current_peer = self.row_ids[sel[0]]
         self.unread[self.current_peer] = 0
         self.status.config(text="")
         self.render_chat()
@@ -202,30 +223,52 @@ class MeshTalkApp:
         self.entry.focus_set()
 
     def update_header(self):
-        if self.current_peer is None:
-            self.chat_title.config(text="No chat open")
-            self.chat_sub.config(text="Pick someone from the list to start chatting")
-            return
-        if self.current_peer == EVERYONE:
-            n = len(self.peer_ids) - 1
+        cid = self.current_peer
+        if cid == EVERYONE:
+            n = len(self.online_ids)
             self.chat_title.config(text="Everyone")
             if n:
                 word = "person" if n == 1 else "people"
                 self.chat_sub.config(text=f"Your message goes to {n} {word} online")
             else:
                 self.chat_sub.config(text="Nobody else is online yet")
-            return
-        name = self.names.get(self.current_peer, self.current_peer)
-        self.chat_title.config(text=name)
-        if self.current_peer in self.peer_ids:
-            self.chat_sub.config(text=f"{self.current_peer}, online now")
+        elif cid.startswith(GROUP_PREFIX):
+            group = self.groups.get(cid[len(GROUP_PREFIX):])
+            if group is None:
+                self.chat_title.config(text="Group")
+                self.chat_sub.config(text="")
+                return
+            parts = []
+            for m in group["members"]:
+                if m == discovery.PEER_ID:
+                    parts.append("You")
+                    continue
+                name = self.names.get(m)
+                label = f"{name} ({m})" if name else m
+                if m not in self.online_ids:
+                    label += " (offline)"
+                parts.append(label)
+            members = ", ".join(parts)
+            if len(members) > 90:
+                members = members[:90] + "..."
+            self.chat_title.config(text=group["name"])
+            self.chat_sub.config(text=members)
         else:
-            self.chat_sub.config(
-                text=f"{self.current_peer}, offline. Messages cannot be delivered")
+            name = self.names.get(cid, cid)
+            self.chat_title.config(text=name)
+            if cid in self.online_ids:
+                self.chat_sub.config(text=f"{cid}, online now")
+            else:
+                self.chat_sub.config(
+                    text=f"{cid}, offline. Messages cannot be delivered")
 
     # ---------- chat area ----------
 
     def draw(self, kind, text, stamp, who=""):
+        if kind == "system":
+            self.chat.insert(tk.END, text, "system")
+            self.chat.insert(tk.END, "\n")
+            return
         label = f"{who}, {stamp}" if who else stamp
         if kind == "me":
             tag, time_tag, caption = "me", "me_time", label
@@ -241,14 +284,11 @@ class MeshTalkApp:
     def render_chat(self):
         self.chat.config(state="normal")
         self.chat.delete("1.0", tk.END)
-        if self.current_peer is None:
-            self.chat.insert(tk.END, "Pick someone from the list to start chatting.", "empty")
-        else:
-            msgs = self.conversations.get(self.current_peer, [])
-            if not msgs:
-                self.chat.insert(tk.END, "No messages yet. Say hello.", "empty")
-            for kind, text, stamp, who in msgs:
-                self.draw(kind, text, stamp, who)
+        msgs = self.conversations.get(self.current_peer, [])
+        if not msgs:
+            self.chat.insert(tk.END, "No messages yet. Say hello.", "empty")
+        for kind, text, stamp, who in msgs:
+            self.draw(kind, text, stamp, who)
         self.chat.config(state="disabled")
         self.chat.see(tk.END)
 
@@ -272,16 +312,74 @@ class MeshTalkApp:
         text = self.entry.get().strip()
         if not text:
             return
-        if self.current_peer is None:
-            self.status.config(text="Select a conversation first")
-            return
-        if self.current_peer == EVERYONE:
+        cid = self.current_peer
+        if cid == EVERYONE:
             target, args = discovery.send_to_everyone, (text,)
+        elif cid.startswith(GROUP_PREFIX):
+            target, args = discovery.send_group_message, (cid[len(GROUP_PREFIX):], text)
         else:
-            target, args = discovery.send_message, (self.current_peer, text)
+            target, args = discovery.send_message, (cid, text)
         threading.Thread(target=target, args=args, daemon=True).start()
         self.entry.delete(0, tk.END)
         self.status.config(text="")
+
+    # ---------- new group dialog ----------
+
+    def open_group_dialog(self):
+        snap = discovery.get_peers_snapshot()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("New group")
+        dlg.configure(bg="white")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        tk.Label(dlg, text="Group name", anchor="w", bg="white", fg=TEXT,
+                 font=(FONT_BOLD, 10)).pack(fill="x", padx=16, pady=(14, 4))
+        name_entry = tk.Entry(dlg, font=(FONT, 11), relief="flat", bd=0, width=34,
+                              highlightthickness=1, highlightbackground=BORDER,
+                              highlightcolor=ACCENT)
+        name_entry.pack(fill="x", padx=16, ipady=6)
+
+        tk.Label(dlg, text="Add people", anchor="w", bg="white", fg=TEXT,
+                 font=(FONT_BOLD, 10)).pack(fill="x", padx=16, pady=(12, 4))
+
+        picks = {}
+        if not snap:
+            tk.Label(dlg, text="Nobody else is online yet. Start MeshTalk on another "
+                     "device or window first.", wraplength=300, justify="left",
+                     bg="white", fg=MUTED, font=(FONT, 10)).pack(padx=16, pady=4)
+        for pid, info in snap.items():
+            var = tk.BooleanVar(value=False)
+            picks[pid] = var
+            tk.Checkbutton(dlg, text=f"{info['name']}  {pid}", variable=var,
+                           anchor="w", bg="white", fg=TEXT, font=(FONT, 11),
+                           activebackground="white", selectcolor="white"
+                           ).pack(fill="x", padx=16)
+
+        error = tk.Label(dlg, text="", anchor="w", bg="white", fg=FAIL_FG,
+                         font=(FONT, 9))
+        error.pack(fill="x", padx=16, pady=(8, 0))
+
+        def create():
+            name = name_entry.get().strip()[:40]
+            members = [pid for pid, var in picks.items() if var.get()]
+            if not name:
+                error.config(text="Give the group a name")
+                return
+            if not members:
+                error.config(text="Pick at least one person")
+                return
+            threading.Thread(target=discovery.create_group, args=(name, members),
+                             daemon=True).start()
+            dlg.destroy()
+
+        tk.Button(dlg, text="Create group", font=(FONT_BOLD, 10), bg=ACCENT, fg="white",
+                  activebackground=ACCENT_DARK, activeforeground="white",
+                  relief="flat", bd=0, pady=8, cursor="hand2", command=create
+                  ).pack(fill="x", padx=16, pady=14)
+        name_entry.bind("<Return>", lambda event: create())
+        name_entry.focus_set()
 
     # ---------- events from the network threads ----------
 
@@ -300,26 +398,53 @@ class MeshTalkApp:
             elif kind == "group_chat":
                 who = f"{e['sender_name']} ({e['sender_id']})"
                 self.add_message(EVERYONE, "them", e["text"], who)
+            elif kind == "group_msg":
+                who = f"{e['sender_name']} ({e['sender_id']})"
+                self.add_message(GROUP_PREFIX + e["group_id"], "them", e["text"], who)
             elif kind == "sent":
                 self.add_message(e["peer_id"], "me", e["text"])
             elif kind == "group_sent":
-                d, f = len(e["delivered"]), len(e["failed"])
-                if d == 0 and f == 0:
-                    self.status.config(text="Nobody else is online, so no one received that")
-                elif d == 0:
-                    self.add_message(EVERYONE, "failed", e["text"])
-                    self.status.config(text="Could not reach anyone: " + ", ".join(e["failed"]))
-                else:
-                    note = f"Delivered to {d}" + (f", failed for {f}" if f else "")
-                    self.add_message(EVERYONE, "me", e["text"], note)
-                    if f:
-                        self.status.config(text="Could not reach: " + ", ".join(e["failed"]))
+                self.report_fanout(EVERYONE, e)
+            elif kind == "group_msg_sent":
+                self.report_fanout(GROUP_PREFIX + e["group_id"], e)
+            elif kind == "group_created":
+                self.handle_group_created(e)
             elif kind == "send_failed":
                 self.add_message(e["peer_id"], "failed", e["text"])
                 self.status.config(text=f"Could not reach {e['name']}: {e['reason']}")
             elif kind == "log":
                 self.status.config(text=e["text"])
         self.root.after(POLL_MS, self.poll_events)
+
+    def report_fanout(self, conv_id, e):
+        d, f = len(e["delivered"]), len(e["failed"])
+        if d == 0 and f == 0:
+            self.status.config(text="Nobody else is online, so no one received that")
+        elif d == 0:
+            self.add_message(conv_id, "failed", e["text"])
+            self.status.config(text="Could not reach anyone: " + ", ".join(e["failed"]))
+        else:
+            note = f"Delivered to {d}" + (f", failed for {f}" if f else "")
+            self.add_message(conv_id, "me", e["text"], note)
+            if f:
+                self.status.config(text="Could not reach: " + ", ".join(e["failed"]))
+
+    def handle_group_created(self, e):
+        cid = GROUP_PREFIX + e["group_id"]
+        owner = e["members"][0]              # the creator always puts themselves first
+        by_me = owner == discovery.PEER_ID
+        if by_me:
+            self.current_peer = cid          # open the group you just made
+            self.unread[cid] = 0
+        self.refresh_peers()                 # first, so the group and names are known
+        if by_me:
+            text = f"You created {e['name']}"
+        else:
+            text = f"{self.names.get(owner, owner)} added you to {e['name']}"
+        self.add_message(cid, "system", text)
+        if e["failed"]:
+            self.status.config(text="Group created, but could not invite: "
+                               + ", ".join(e["failed"]))
 
 
 def main():
